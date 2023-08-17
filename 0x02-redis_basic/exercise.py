@@ -1,58 +1,80 @@
 #!/usr/bin/env python3
-""" Module for Redis db """
-import redis
-from uuid import uuid4
+"""
+Redis basic.
+"""
 from typing import Union, Callable, Optional
-from sys import byteorder
 from functools import wraps
+import redis
+import uuid
 
 
-def count_calls(method: Callable) -> Callable:
-    """ Counts number of calls to a class method """
-    # use qualname dunder for qualified class method name
-    key = method.__qualname__
-    # use functools.wraps to create wrapper method for incrementing
+def call_history(method: Callable) -> Callable:
+    """Stores the history of inputs and outputs for a particular function"""
+    method_key = method.__qualname__
+    inputs, outputs = method_key + ':inputs', method_key + ':outputs'
 
     @wraps(method)
     def wrapper(self, *args, **kwargs):
-        """ Wrapper for method """
-        self._redis.incr(key)
-        return method(self, *args, **kwargs)
-
+        self._redis.rpush(inputs, str(args))
+        result = method(self, *args, **kwargs)
+        self._redis.rpush(outputs, str(result))
+        return result
     return wrapper
 
 
-class Cache:
-    """ Class for methods that operate a caching system """
+def count_calls(method: Callable) -> Callable:
+    """Creates and returns function that increments the count \
+        for that key every time the method is called and returns \
+        the value returned by the original method"""
+    method_key = method.__qualname__
 
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        self._redis.incr(method_key)
+        return method(self, *args, **kwargs)
+    return wrapper
+
+
+def replay(method: Callable) -> None:
+    """Displays the history of calls of a particular function"""
+    method_key = method.__qualname__
+    inputs, outputs = method_key + ':inputs', method_key + ':outputs'
+    redis = method.__self__._redis
+    method_count = redis.get(method_key).decode('utf-8')
+    print(f'{method_key} was called {method_count} times:')
+    IOTuple = zip(redis.lrange(inputs, 0, -1), redis.lrange(outputs, 0, -1))
+    for inp, outp in list(IOTuple):
+        attr, data = inp.decode("utf-8"), outp.decode("utf-8")
+        print(f'{method_key}(*{attr}) -> {data}')
+
+
+class Cache:
+    """Cache class to handle redis operations."""
     def __init__(self):
-        """ Instance of Redis db """
+        """stores an instance of the Redis client."""
         self._redis = redis.Redis()
         self._redis.flushdb()
 
+    @call_history
     @count_calls
     def store(self, data: Union[str, bytes, int, float]) -> str:
-        """ Creates key and stores it with data """
-        # uuid must be type cast to str for Redis to be able to accept it
-        key = str(uuid4())
-        # use pipelining for multi sets, mset() is not approrpiate for a cache
-        self._redis.set(key, data)
+        """Takes and stores a data argument and returns a string."""
+        key = str(uuid.uuid4())
+        self._redis.mset({key: data})
         return key
 
-    def get(self, key: str, fn: Optional[Callable] = None)\
-            -> Union[str, bytes, int, float]:
-        """ Returns data converted to desired format """
-        # default Redis.get in case key does not exist
+    def get(self,
+            key: str, fn: Optional[Callable] = None) -> str:
+        """Takes a key string argument and an optional.
+        Callable argument named fn. This callable will be used to\
+            convertthe data back to a desired format."""
         data = self._redis.get(key)
-        # use callable if one provided
-        if fn:
-            data = fn(data)
-        return data
+        return fn(data) if fn is not None else data
 
-    def get_str(self, data: bytes) -> str:
-        """ Convert bytes to str """
-        return data.decode('utf-8')
+    def get_str(self, data: str) -> str:
+        """Returns str value of decoded byte """
+        return data.decode('utf-8', 'strict')
 
-    def get_int(self, data: bytes) -> int:
-        """ Convert bytes to int """
-        return int.from_bytes(data, byteorder)
+    def get_int(self, data: str) -> int:
+        """Returns int value of decoded byte """
+        return int(data)
